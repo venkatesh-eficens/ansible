@@ -1,5 +1,5 @@
 ---
-- name: Check IAM role attached to EC2 instances using public IPs
+- name: Installing CWAgent for multiple ec2 instance.
   hosts: all
   become: true
   gather_facts: no
