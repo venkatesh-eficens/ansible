@@ -1,0 +1,6 @@
+all:
+  hosts:
+    ec2_instance1:
+      ansible_host: 10.0.8.210 (private ip)
+    ec2_instance2:
+      ansible_host: 10.0.8.231 (private ip)
