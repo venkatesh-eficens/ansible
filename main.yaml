@@ -1,0 +1,219 @@
+---
+- name: Check IAM role attached to EC2 instances using public IPs
+  hosts: all
+  become: true
+  gather_facts: no
+  connection: local
+  vars:
+    private_key_file: "/home/ubuntu/KeyPairs/*.pem"  # Define the private key file path
+    cw_agent_version: "latest"
+    aws_region: "us-west-1"  
+  tasks:
+    - name: Get instance ID from private IP
+      command: "aws ec2 describe-instances --region us-west-1 --filters 'Name=private-ip-address,Values={{ ansible_host }}' --query 'Reservations[].Instances[].InstanceId' --output text"
+      register: instance_id
+      failed_when: instance_id.rc != 0 or instance_id.stdout == ""
+      changed_when: false
+
+    - name: Get instance ID and name from private IP
+      command: "aws ec2 describe-instances --region us-west-1 --filters 'Name=private-ip-address,Values={{ ansible_host }}' --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`].Value]' --output text"
+      register: instance_info
+      failed_when: instance_info.rc != 0 or instance_info.stdout == ""
+      changed_when: false
+    
+    - name: Get key pair name from instance
+      command: "aws ec2 describe-instances --region {{ aws_region }} --instance-ids {{ instance_id.stdout }} --query 'Reservations[].Instances[].KeyName' --output text"
+      register: keypair_name
+      failed_when: keypair_name.rc != 0 or keypair_name.stdout == ""
+      changed_when: false
+
+    - name: Set host-specific variables
+      set_fact:
+        ansible_ssh_private_key_file: "/home/ubuntu/KeyPairs/{{ keypair_name.stdout }}.pem"
+    
+    - name: Display information
+      debug:
+        msg: >
+          Instance ID: {{ instance_id.stdout }}
+          Key Pair Name: {{ keypair_name.stdout }}
+          Private Key File: {{ ansible_ssh_private_key_file }}
+
+    - name: Fetch IAM role attached to the instance
+      command: aws ec2 describe-instances --region us-west-1 --instance-ids "{{ instance_id.stdout }}" --query "Reservations[].Instances[].IamInstanceProfile.Arn" --output text
+      register: iam_role_arn
+      failed_when: iam_role_arn.rc != 0
+      changed_when: false
+
+    - name: Check if IAM role is attached, if not, attach the existing IAM role
+      block:
+        - name: Get existing IAM role
+          shell: aws iam list-instance-profiles | grep -q 'cloud' && echo "cloud" || echo "none"
+          register: existing_role
+          changed_when: false
+
+        - name: Attach existing IAM role to instance
+          command: >
+            aws ec2 associate-iam-instance-profile
+            --region us-west-1
+            --instance-id "{{ instance_id.stdout }}"
+            --iam-instance-profile Name={{ existing_role.stdout }}
+          when: existing_role.stdout == "cloud" and iam_role_arn.stdout == ""
+
+    - name: Display IAM role information
+      debug:
+        msg: >
+          {% if iam_role_arn.stdout %}
+          IAM role attached to EC2 instance with public IP {{ ansible_host }} is {{ iam_role_arn.stdout }}
+          {% else %}
+          No IAM role attached to EC2 instance with public IP {{ ansible_host }}
+          {% endif %}
+
+    - name: Check if CloudWatchFullAccess policy is attached
+      shell: >
+        aws iam list-attached-role-policies
+        --role-name {{ iam_role_arn.stdout.split('/')[-1] }}
+        --query "attachedPolicies[?PolicyName=='CloudWatchFullAccess']"
+        --output text
+      register: cloudwatch_policy_attached
+      changed_when: false
+
+    - name: Display IAM role and CloudWatchFullAccess policy status
+      debug:
+        msg: >
+          IAM role attached to EC2 instance with public IP {{ ansible_host }}:
+          - IAM role: {{ iam_role_arn.stdout }}
+          - CloudWatchFullAccess policy attached: {{ cloudwatch_policy_attached.stdout | default('Not attached') }}
+
+    - name: Display IAM role information after attached role
+      debug:
+        msg: >
+          {% if iam_role_arn.stdout %}
+          IAM role attached to EC2 instance with public IP {{ ansible_host }} is {{ iam_role_arn.stdout }}
+          {% else %}
+          No IAM role attached to EC2 instance with public IP {{ ansible_host }}
+          {% endif %}
+
+    - name: Attach CloudWatchFullAccess policy if not attached
+      command: >
+        aws iam attach-role-policy
+        --role-name {{ iam_role_arn.stdout.split('/')[-1] }}
+        --policy-arn arn:aws:iam::aws:policy/CloudWatchFullAccess
+        --region us-west-1
+      when: cloudwatch_policy_attached.stdout == "None"
+
+
+- name: Install and configure CloudWatch Agent on Ubuntu
+  hosts: all
+  become: true
+  vars:
+    private_key_file: "/home/ubuntu/KeyPairs/*.pem"  # Define the private key file path
+    cw_agent_version: "latest"
+    aws_region: "us-west-1"
+#    iam_role_name: "cloud"  # Specify the IAM role name to be attached
+  tasks:
+
+    - name: Download CloudWatch Agent installer for Ubuntu
+      get_url:
+        url: "https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb"
+        dest: "/tmp/amazon-cloudwatch-agent.deb"
+
+    - name: Install CloudWatch Agent on Ubuntu
+      apt:
+        deb: "/tmp/amazon-cloudwatch-agent.deb"
+
+    - name: Create directory for CloudWatch Agent configuration
+      file:
+        path: "/opt/aws/amazon-cloudwatch-agent/etc/"
+        state: directory
+    - name: Copy CloudWatch Agent configuration file
+      copy:
+        src: "cloudwatch_config.json"
+        dest: "/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+      notify: Restart CloudWatch Agent
+    - name: Configure CloudWatch Agent
+      template:
+        src: "cloudwatch_config.json"
+        dest: "/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+      notify: Restart CloudWatch Agent
+
+- name: Create CloudWatch Alarms
+  hosts: all
+  connection: local
+  gather_facts: no
+  vars:
+    aws_region: "us-west-1"
+  tasks:
+
+    - name: Create CloudWatch Alarms for Disk Usage
+      ec2_metric_alarm:
+        name: "DiskUsageAlarm_{{ instance_info.stdout_lines[1] }}"
+        state: present
+        dimensions:
+          InstanceId: "{{ instance_info.stdout_lines[0] }}"
+        namespace: "CWAgent"
+        metric: "DiskSpaceUtilization"
+        comparison: "GreaterThanOrEqualToThreshold"
+        threshold: 85
+        period: 300
+        evaluation_periods: 5
+        statistic: "Maximum"
+        treat_missing_data: notBreaching
+        alarm_actions: [ "arn:aws:sns:us-west-1:238393102293:cwagent" ]
+        region: "{{ aws_region }}"
+
+    - name: Create CloudWatch Alarms for Memory Usage
+      ec2_metric_alarm:
+        name: "MemoryUsageAlarm_{{ instance_info.stdout_lines[1] }}"
+        state: present
+        dimensions:
+          InstanceId: "{{ instance_info.stdout_lines[0] }}"
+        namespace: "CWAgent"
+        metric: "mem_used_percent"
+        comparison: "GreaterThanOrEqualToThreshold"
+        threshold: 85
+        period: 300
+        evaluation_periods: 5
+        statistic: "Average"
+        treat_missing_data: notBreaching
+        alarm_actions: [ "arn:aws:sns:us-west-1:238393102293:cwagent" ]
+        region: "{{ aws_region }}"
+
+    - name: Create CloudWatch Alarms for CPU Utilization
+      ec2_metric_alarm:
+        name: "CPUUtilizationAlarm_{{ instance_info.stdout_lines[1] }}"
+        state: present
+        dimensions:
+          InstanceId: "{{ instance_info.stdout_lines[0] }}"
+        namespace: "AWS/EC2"
+        metric: "CPUUtilization"
+        comparison: "GreaterThanOrEqualToThreshold"  # Adjust the comparison based on your requirements
+        threshold: 85  # Set the threshold as needed
+        period: 300
+        evaluation_periods: 5
+        statistic: "Average"
+        treat_missing_data: notBreaching
+        alarm_actions: [ "arn:aws:sns:us-west-1:238393102293:cwagent" ]
+        region: "{{ aws_region }}"
+
+    - name: Create CloudWatch Alarms for Status Checks
+      ec2_metric_alarm:
+        name: "StatusCheckAlarm_{{ instance_info.stdout_lines[1] }}"
+        state: present
+        dimensions:
+          InstanceId: "{{ instance_info.stdout_lines[0] }}"
+        namespace: "AWS/EC2"
+        metric: "StatusCheckFailed"
+        comparison: "GreaterThanOrEqualToThreshold"  # Adjust the comparison based on your requirements
+        threshold: 1  # Set the threshold as needed
+        period: 300
+        evaluation_periods: 5  # Adjust as needed
+        statistic: "Minimum"
+        treat_missing_data: notBreaching
+        alarm_actions: [ "arn:aws:sns:us-west-1:238393102293:cwagent" ]
+        region: "{{ aws_region }}"
+
+  handlers:
+    - name: Restart CloudWatch Agent
+      service:
+        name: amazon-cloudwatch-agent
+        state: restarted
